@@ -781,16 +781,21 @@ The TTS CI non-streaming and streaming stages run this probe for Qwen3-TTS on fo
 
 ## Apple Silicon (Native MLX)
 
-`qwen3_tts_server` from the native MLX runtime (`sglang_omni_mlx/native`) serves the CustomVoice `/v1/audio/speech` API on an Apple Silicon Mac, from the bf16 [`mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16`](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16) checkpoint, as one C++ process without CUDA, PyTorch or Python.
+The native MLX runtime serves both BF16 CustomVoice sizes through `POST /v1/audio/speech` on Apple Silicon. The installed C++ server and CLI use the same model directory. When loading 1.7B, the runtime projects 14 fixed codebook embedding tables (56 MiB total) so each generated frame can look up its intermediate predictor inputs.
+
+| Checkpoint | Tested revision |
+| --- | --- |
+| [0.6B CustomVoice BF16](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16) | `6415d95f88be018ff9e46813119dc3bc12261328` |
+| [1.7B CustomVoice BF16](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16) | `52f4770fd9726457eae3d3b6aa92047a25a10776` |
 
 ```bash
 sglang_omni_mlx/native/scripts/build_runtime.sh ~/omni-runtime
 
-hf download mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16 \
-  --revision 6415d95f88be018ff9e46813119dc3bc12261328 --local-dir qwen3-tts-0.6b-customvoice
+hf download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16 \
+  --revision 52f4770fd9726457eae3d3b6aa92047a25a10776 --local-dir qwen3-tts-1.7b-customvoice
 
-~/omni-runtime/bin/qwen3_tts_server --model-path qwen3-tts-0.6b-customvoice \
-  --model-name Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --port 8000
+~/omni-runtime/bin/qwen3_tts_server --model-path qwen3-tts-1.7b-customvoice \
+  --model-name Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --port 8000
 ```
 
 The CustomVoice requests above work unchanged, with the same speakers, `language` values, sampling defaults (`max_new_tokens` 2048), `stage_params.tts_engine` overrides and prompt: the whole text is in the prompt, as the CUDA server's CustomVoice requests are. The native server differs from the CUDA server in that:
@@ -798,14 +803,26 @@ The CustomVoice requests above work unchanged, with the same speakers, `language
 - `response_format` is `wav` or `pcm`; `stream_format` must be `audio`.
 - The prompt and `max_new_tokens` must fit the talker's 8192 positions, as on CUDA: a larger `max_new_tokens` returns 400, and the default 2048 shrinks to fit. `instructions` are at most 4096 characters, and `repetition_penalty` must be above 0.
 - `seed` repeats a request's audio on the same chip and MLX version; it does not reproduce CUDA's audio.
-- A streamed request decodes a first chunk of `initial_codec_chunk_frames` frames (default 5, at most 25; `0` starts at 25, as on CUDA), then 25-frame chunks, each with 25 frames of left context; a whole request decodes in the CUDA vocoder's 300-frame chunks. Streamed and whole audio can differ slightly near chunk edges. `stream_codec_output` and `suppress_bootstrap_silence` are checked and then ignored.
+- A streamed request sends `initial_codec_chunk_frames` first (default 5, at most 25), then packets of 25 frames. Setting it to 0 starts with 25. The 1.7B decoder carries convolution history and attention keys and values between 25-frame codec blocks. A short first packet can emit the causal prefix of a block before the block is complete. The 0.6B decoder uses 25 frames of left context. Whole requests decode in chunks of up to 300 frames. `stream_codec_output` and `suppress_bootstrap_silence` are accepted for compatibility.
 - Started with `--model-name`, it returns 404 for any other `model`; without that flag, `model` is ignored, as on CUDA.
 - Errors are `{"detail": "..."}`.
 - Requests run one at a time and `--max-queued-requests` (default 2) more wait; the rest get 503, and `/health` shows the queue.
 - A request not finished `--request-timeout-s` (default 600) seconds after it arrives, time in the queue included, is cancelled: it returns 504, or its stream ends early. A client that disconnects cancels its request.
 - A request body over 1 MiB returns 413.
 
-Measured on an Apple M5 MacBook (24 GB), warm: 0.46 s from launch to a healthy `/health`, 0.22 s (p50) to the first streamed audio, real-time factor 0.50 over 17 requests, and a peak memory footprint of 5.6 GB for a 5 s utterance and 13.2 GB for a 20 s one. The peak is the speech decoder's float32 upsampling over a 300-frame chunk, as in mlx-audio. Transcribed back with Qwen3-ASR-0.6B, 10 English sentences give 0% WER and 5 Chinese sentences 0% CER. With the same seed and MLX build, its audio codes are bit-identical to mlx-audio 0.5.8's Qwen3-TTS on all 22 requests compared, in both the CUDA server's prompt layout and mlx-audio's own; so is its 16-bit PCM up to 72 frames (5.8 s), beyond which the decoder's 72-frame sliding window, which the CUDA vocoder applies and mlx-audio does not, changes the samples. Mac CI checks six seeded requests' codes (English, Chinese, Japanese, Korean, the Beijing dialect speaker, and a `max_new_tokens` cap) against `sglang_omni_mlx/native/ci/model_golden/qwen3-tts-12hz-0.6b-customvoice.json`.
+For the 0.6B checkpoint on an Apple M5 MacBook (24 GB), warm measurements were 0.46 s from launch to a healthy `/health`, 0.22 s (p50) to the first streamed audio, real-time factor 0.50 over 17 requests, and a peak memory footprint of 5.6 GB for a 5 s utterance and 13.2 GB for a 20 s one. The peak is the speech decoder's float32 upsampling over a 300-frame chunk, as in mlx-audio. Transcribed back with Qwen3-ASR-0.6B, 10 English sentences give 0% WER and 5 Chinese sentences 0% CER. With the same seed and MLX build, its audio codes are bit-identical to mlx-audio 0.5.8's Qwen3-TTS on all 22 requests compared, in both the CUDA server's prompt layout and mlx-audio's own; so is its 16-bit PCM up to 72 frames (5.8 s), beyond which the decoder's 72-frame sliding window, which the CUDA vocoder applies and mlx-audio does not, changes the samples.
+
+On an M1 Pro (16 GB, macOS 26.6.2), the 1.7B BF16 model matched mlx-audio 0.5.8 on all six fixed requests, including every prompt ID, all 16 codes per frame, the finish reason and the PCM16 hash. The six 0.6B requests also matched the original runtime on the same machine. A longer 1.7B request produced 133 identical codec frames and 255,360 samples in each implementation. Its first differing sample was at index 138,257 (zero-based), in frame 72. Both waveforms transcribed to the same 31 reference words with the pinned 6-bit Qwen3-ASR-1.7B.
+
+Run the model checks on an Apple Silicon host with the provisioned checkpoints. Hosted Mac CI covers packaging, protocol and startup. Use this command for the local 1.7B golden check.
+
+```bash
+python sglang_omni_mlx/native/ci/check_model_golden.py \
+  --runtime-bin ~/omni-runtime/bin --data-root "$CI_DATA_ROOT" \
+  --golden sglang_omni_mlx/native/ci/model_golden/qwen3-tts-12hz-1.7b-customvoice.json
+```
+
+For an independent comparison, install `mlx-audio==0.5.8` in the build wheel environment and run `sglang_omni_mlx/native/ci/generate_qwen3_tts_reference.py` with `--model-path`, `--golden` and `--output-directory`. The script checks the local checkpoint hashes and reads only the requests from the golden file. Each result directory contains the reference prompt IDs, codec frames, finish reason and WAV.
 
 ## Known Limitations
 

@@ -31,15 +31,18 @@ struct Qwen3DecoderConfig {
   bool rotary_tables = false;
   int hidden_size = 0;
   int vocab_size = 0;
+  // Short, fixed predictor sequences only need the rows generated so far.
+  bool compact_kv = false;
 
   static Qwen3DecoderConfig FromJson(const nlohmann::json &text_config);
 };
 
-// Per-layer key/value cache that grows in fixed steps.
+// Per-layer key/value cache. The default update reserves space in fixed steps.
 class KVCache {
 public:
   std::pair<mlx::core::array, mlx::core::array>
-  UpdateAndFetch(const mlx::core::array &keys, const mlx::core::array &values);
+  UpdateAndFetch(const mlx::core::array &keys, const mlx::core::array &values,
+                 bool compact = false);
   // Drops the newest token_count positions; the next update overwrites them.
   void Trim(int token_count);
   int offset() const { return offset_; }
@@ -59,6 +62,8 @@ public:
   // table.
   Qwen3Decoder(const omni_common::Checkpoint &checkpoint, std::string prefix,
                Qwen3DecoderConfig config);
+  // Combine the dense, bias-free MLP input projections into one matmul.
+  void PackDenseGateUp();
 
   // Token ids [1, length] to embeddings [1, length, hidden].
   mlx::core::array EmbedTokens(const mlx::core::array &ids) const;
@@ -108,6 +113,7 @@ private:
   const omni_common::Checkpoint &checkpoint_;
   std::string prefix_;
   Qwen3DecoderConfig config_;
+  std::vector<mlx::core::array> gate_up_weights_;
 };
 
 } // namespace qwen3_asr

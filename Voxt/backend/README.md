@@ -36,6 +36,8 @@ API `voxtral_tts_server` uses (`qwen3_asr/speech_service`); see the
 [Drama 3 cookbook](../../docs/cookbook/fishaudio_drama3.md#apple-silicon-native-mlx).
 Voxt does not start it.
 
+The installed `qwen3_tts_server` and `qwen3_tts_synthesize` binaries run the BF16 Qwen3-TTS 0.6B and 1.7B CustomVoice checkpoints as standalone speech producers. The server takes a model directory and serves whole WAV or streamed PCM on `/v1/audio/speech`. See the [Qwen3-TTS cookbook](../../docs/cookbook/qwen3_tts.md#apple-silicon-native-mlx) for the pinned revisions and launch command.
+
 ## Build and run
 
 Requirements: an Apple Silicon Mac, Xcode and [uv](https://docs.astral.sh/uv/).

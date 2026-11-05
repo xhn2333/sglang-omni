@@ -42,9 +42,25 @@ Qwen3DecoderConfig::FromJson(const nlohmann::json &text_config) {
   return config;
 }
 
-std::pair<mx::array, mx::array>
-KVCache::UpdateAndFetch(const mx::array &keys, const mx::array &values) {
+std::pair<mx::array, mx::array> KVCache::UpdateAndFetch(const mx::array &keys,
+                                                        const mx::array &values,
+                                                        bool compact) {
   const int new_token_count = keys.shape(2);
+  if (compact) {
+    if (offset_ == 0) {
+      keys_ = keys;
+      values_ = values;
+    } else {
+      const mx::Shape kept = {keys.shape(0), keys.shape(1), offset_,
+                              keys.shape(3)};
+      keys_ = mx::concatenate({mx::slice(*keys_, {0, 0, 0, 0}, kept), keys}, 2);
+      values_ =
+          mx::concatenate({mx::slice(*values_, {0, 0, 0, 0}, kept), values}, 2);
+    }
+    offset_ += new_token_count;
+    return {*keys_, *values_};
+  } else {
+  }
   if (!keys_.has_value() || offset_ + new_token_count > keys_->shape(2)) {
     const int step_count =
         (new_token_count + kKvCacheStepTokens - 1) / kKvCacheStepTokens;
@@ -90,6 +106,26 @@ std::string Qwen3Decoder::Name(const std::string &suffix) const {
   return prefix_.empty() ? suffix : prefix_ + "." + suffix;
 }
 
+void Qwen3Decoder::PackDenseGateUp() {
+  std::vector<mx::array> packed;
+  for (int layer = 0; layer < config_.num_hidden_layers; ++layer) {
+    const std::string prefix =
+        Name("layers." + std::to_string(layer) + ".mlp.");
+    const std::string gate = prefix + "gate_proj";
+    const std::string up = prefix + "up_proj";
+    if (checkpoint_.Has(gate + ".scales") || checkpoint_.Has(up + ".scales") ||
+        checkpoint_.Has(gate + ".bias") || checkpoint_.Has(up + ".bias")) {
+      return;
+    } else {
+    }
+    packed.push_back(mx::concatenate({checkpoint_.Weight(gate + ".weight"),
+                                      checkpoint_.Weight(up + ".weight")},
+                                     0));
+  }
+  mx::eval(packed);
+  gate_up_weights_ = std::move(packed);
+}
+
 mx::array Qwen3Decoder::EmbedTokens(const mx::array &ids) const {
   return checkpoint_.Embed(ids, Name("embed_tokens"));
 }
@@ -113,7 +149,8 @@ mx::array Qwen3Decoder::Layer(const mx::array &x, int layer, KVCache &cache,
   }
   queries = Rotated(mx::transpose(queries, {0, 2, 1, 3}), cache, rotary);
   const auto [keys, values] = KeysValues(normed, prefix, cache, rotary);
-  auto [cached_keys, cached_values] = cache.UpdateAndFetch(keys, values);
+  auto [cached_keys, cached_values] =
+      cache.UpdateAndFetch(keys, values, config_.compact_kv);
   const float scale =
       static_cast<float>(std::pow(static_cast<double>(head_dim), -0.5));
   std::optional<mx::array> attended;
@@ -133,13 +170,20 @@ mx::array Qwen3Decoder::Layer(const mx::array &x, int layer, KVCache &cache,
                             prefix + ".self_attn.o_proj"));
   const mx::array mlp_input =
       checkpoint_.RmsNorm(hidden, prefix + ".post_attention_layernorm", eps);
-  return mx::add(
-      hidden,
-      checkpoint_.Linear(
-          mx::multiply(omni_common::Silu(checkpoint_.Linear(
-                           mlp_input, prefix + ".mlp.gate_proj")),
-                       checkpoint_.Linear(mlp_input, prefix + ".mlp.up_proj")),
-          prefix + ".mlp.down_proj"));
+  const mx::array activated = [&] {
+    if (gate_up_weights_.empty()) {
+      return mx::multiply(
+          omni_common::Silu(
+              checkpoint_.Linear(mlp_input, prefix + ".mlp.gate_proj")),
+          checkpoint_.Linear(mlp_input, prefix + ".mlp.up_proj"));
+    } else {
+      const auto halves = mx::split(
+          mx::matmul(mlp_input, mx::transpose(gate_up_weights_[layer])), 2, -1);
+      return mx::multiply(omni_common::Silu(halves[0]), halves[1]);
+    }
+  }();
+  return mx::add(hidden,
+                 checkpoint_.Linear(activated, prefix + ".mlp.down_proj"));
 }
 
 mx::array Qwen3Decoder::Forward(const mx::array &embeddings,
